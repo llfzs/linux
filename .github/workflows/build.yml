@@ -1,0 +1,314 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: 'code002-2/linux ref to build against'
+        default: piano-7.2.6
+        required: true
+      image_size:
+        description: 'expanded userdata size'
+        default: 12G
+        required: true
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      # ccache must live where the cache steps save/restore it: the build runs
+      # in src/, so the default (~/.cache/ccache) is invisible to actions/cache
+      # and every run would recompile the kernel from scratch.
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # Runner image clang updates must invalidate the cache, not mis-hit.
+      CCACHE_COMPILERCHECK: content
+      # The cache shares the runner SSD with the kernel tree, the rootfs and
+      # the image being assembled; cap it instead of letting ccache take 5 GiB.
+      CCACHE_MAXSIZE: 3G
+    steps:
+      - name: Free up runner disk space
+        run: |
+          df -h /
+          # The standard arm64 runner has a small SSD while this pipeline holds
+          # a kernel tree, a Debian GNOME rootfs and a 12 GiB userdata image at
+          # the same time. Drop the preinstalled SDKs we never use.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /opt/hostedtoolcache /usr/local/share/boost /opt/az /usr/lib/jvm || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout this repository
+        uses: actions/checkout@v5
+        with:
+          path: src
+          persist-credentials: false
+
+      - name: Checkout the kernel
+        uses: actions/checkout@v5
+        with:
+          repository: code002-2/linux
+          ref: ${{ github.event.inputs.kernel_ref || 'piano-7.2.6' }}
+          path: src/kernel
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout piano firmware
+        uses: actions/checkout@v5
+        with:
+          repository: blu-sharky/piano-firmware
+          ref: main
+          path: src/firmware
+          persist-credentials: false
+
+      - name: Checkout AudioReach topology macros
+        uses: actions/checkout@v5
+        with:
+          repository: linux-msm/audioreach-topology
+          ref: 993a17dcb672357998a463a73f120064d6c74f4f
+          path: src/audioreach-topology
+          persist-credentials: false
+
+      - name: Checkout v4l2loopback
+        uses: actions/checkout@v5
+        with:
+          repository: umlaeute/v4l2loopback
+          ref: 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4
+          path: src/v4l2loopback
+          persist-credentials: false
+
+      - name: Normalize script permissions
+        working-directory: src
+        run: |
+          # The build invokes these scripts directly and asserts -x on some of
+          # them, so keep them executable even when the tree came from an
+          # upload path that drops the mode bits.
+          chmod +x scripts/*.sh
+          ls -l scripts/build-rootfs-image.sh scripts/fetch-arm64-tools.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              clang lld llvm ccache make flex bison bc libssl-dev libelf-dev \
+              rsync cpio kmod device-tree-compiler debootstrap \
+              debian-archive-keyring curl openssh-client openssl \
+              e2fsprogs python3 zstd xz-utils lz4 m4 alsa-utils file \
+              qemu-user-static binfmt-support
+          sudo systemctl restart systemd-binfmt || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: piano-clang-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            piano-clang-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build the uperf userspace packages
+        working-directory: src
+        run: |
+          if [ -d uperf ] && [ -f uperf/CMakeLists.txt ]; then
+            sudo apt-get install -y --no-install-recommends \
+                cmake ninja-build build-essential pkg-config \
+                libglib2.0-dev libsystemd-dev libjson-c-dev libdbus-1-dev \
+                libpolkit-gobject-1-dev libgtk-4-dev libadwaita-1-dev \
+                libgirepository1.0-dev gobject-introspection
+            cmake -S uperf -B out/uperf -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+            cmake --build out/uperf -j"$(nproc)"
+            DESTDIR="$PWD/out/uperf-root" cmake --install out/uperf
+            mkdir -p out/uperf-pkg
+            if command -v dpkg-deb >/dev/null; then
+              root=out/uperf-root
+              mkdir -p "$root/DEBIAN"
+              {
+                echo 'Package: uperf-linux'
+                echo 'Version: 1.0.0+piano'
+                echo 'Architecture: arm64'
+                echo 'Maintainer: code002-2'
+                echo 'Description: piano performance control daemon and GUI'
+              } > "$root/DEBIAN/control"
+              dpkg-deb --build --root-owner-group "$root" out/uperf-pkg/uperf-linux.deb
+            fi
+            echo "uperf $(git -C . rev-parse HEAD 2>/dev/null || echo unknown)" > out/uperf-pkg/SOURCE
+          else
+            echo 'uperf/ not present; skipping'
+          fi
+
+      - name: Fetch the arm64 toolchain bits
+        working-directory: src
+        run: |
+          mkdir -p out
+          df -h /
+          scripts/fetch-arm64-tools.sh --output-dir out/arm64-tools
+          df -h /
+
+      - name: Build the matched GNOME image set
+        working-directory: src
+        env:
+          SSH_PUBLIC_KEY: ${{ vars.PIANO_SSH_PUBLIC_KEY }}
+        run: |
+          set -o pipefail
+          test -f kernel/arch/arm64/configs/piano_rootfs.config
+          test -x scripts/build-rootfs-image.sh
+          ccache --zero-stats
+          mkdir -p out
+          key_args=()
+          if [ -n "$SSH_PUBLIC_KEY" ]; then
+            printf '%s\n' "$SSH_PUBLIC_KEY" > out/authorized_keys
+            key_args=(--authorized-keys "$PWD/out/authorized_keys")
+          fi
+          userspace_args=()
+          if ls out/uperf-pkg/*.deb >/dev/null 2>&1; then
+            userspace_args=(--sensors-dir "$PWD/out/uperf-pkg")
+          fi
+          # Disk timeline for this step: the small runner SSD is the known
+          # failure mode here, and it is invisible in a plain step log.
+          (
+            while :; do
+              date -u '+%H:%M:%S'
+              df -h /
+              sleep 60
+            done
+          ) > out/disk.log 2>&1 &
+          disk_monitor=$!
+          df -h /
+          scripts/build-rootfs-image.sh \
+              --firmware-tree firmware/firmware \
+              --audioreach-topology audioreach-topology \
+              --v4l2loopback v4l2loopback \
+              "${userspace_args[@]}" \
+              --jobs "$(nproc)" \
+              --image-size "${{ github.event.inputs.image_size || '12G' }}" \
+              --output out/ci-image "${key_args[@]}" 2>&1 | tee out/build.log
+          kill "$disk_monitor" 2>/dev/null || true
+          df -h /
+          {
+            echo "uperf $(git -C . rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "audioreach-topology $(git -C audioreach-topology rev-parse HEAD)"
+            echo "v4l2loopback $(git -C v4l2loopback rev-parse HEAD)"
+            echo 'Firmware comes from blu-sharky/piano-firmware; see its README compliance statement.'
+            echo 'Profile: full GNOME, Chinese locale, VA-API and V4L2 hardware video, uperf-linux.'
+            if [ -z "$SSH_PUBLIC_KEY" ]; then
+              echo 'Access: per-build random key; private half published in the piano-access-key artifact.'
+            fi
+          } >> out/ci-image/MANIFEST.txt
+
+      - name: Reclaim build-only space
+        if: always()
+        working-directory: src
+        run: |
+          df -h /
+          # The image set is assembled: the kernel build tree, the rootfs
+          # bootstrap and the staging trees are no longer needed, while the
+          # packaging step still compresses and uploads several GiB.
+          sudo rm -rf out/ci-image/rootfs-build out/ci-image/stage \
+              kernel/out out/arm64-tools || true
+          df -h /
+
+      - name: Upload the build and disk logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-build-log-${{ github.sha }}
+          path: |
+            src/out/build.log
+            src/out/disk.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Package the flashable set and the rootfs tarball
+        working-directory: src
+        run: |
+          rm -f out/ci-image/userdata.raw.img
+          scripts/sign-boot-avb.sh out/ci-image/boot.img
+          echo "boot.img: AVB-signed after build; flashed sha256 $(sha256sum out/ci-image/boot.img | cut -d' ' -f1)" >> out/ci-image/MANIFEST.txt
+          mkdir -p out/bundle out/rootfs-tar
+          zstd -T0 -10 --rm out/ci-image/userdata.img -o out/bundle/userdata.img.zst
+          cp out/ci-image/boot.img out/ci-image/dtbo.img \
+              out/ci-image/kernel.config out/ci-image/packages.txt \
+              out/ci-image/MANIFEST.txt out/ci-image/SOURCE-SHA256SUMS out/bundle/
+          # the uperf packages ride along so they can be installed on a device
+          # that is already running, without rebuilding the image.
+          if ls out/uperf-pkg/*.deb >/dev/null 2>&1; then
+            cp out/uperf-pkg/*.deb out/bundle/
+          fi
+          (cd out/bundle && sha256sum ./* > SHA256SUMS)
+          sudo tar --numeric-owner --xattrs --acls -C out/ci-image/rootfs \
+              -I 'zstd -T0 -3' -cf out/rootfs-tar/rootfs-trixie-gnome-arm64.tar.zst .
+          (cd out/rootfs-tar && sha256sum ./* > SHA256SUMS)
+          du -sh out/bundle/* out/rootfs-tar/*
+
+      - name: Publish the ephemeral access key
+        if: ${{ vars.PIANO_SSH_PUBLIC_KEY == '' }}
+        working-directory: src
+        run: |
+          mkdir -p out/access-key
+          cp out/ci-image/access-key out/ci-image/access-key.pub out/access-key/
+          {
+            echo '## Ephemeral SSH access key'
+            echo 'This build generated a fresh random key.'
+            echo '```'
+            echo 'chmod 600 access-key'
+            echo 'ssh -i access-key piano@10.42.0.2'
+            echo '```'
+            cat out/ci-image/access-key.pub
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Prune this ref's older compiler caches
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+            --key piano-clang- --limit 100 --json id --jq '.[].id' |
+            xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: piano-clang-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload the flashable set
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-gnome-flash-${{ github.sha }}
+          path: src/out/bundle/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload the rootfs tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-gnome-rootfs-${{ github.sha }}
+          path: src/out/rootfs-tar/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload the ephemeral access key
+        if: ${{ vars.PIANO_SSH_PUBLIC_KEY == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-access-key-${{ github.sha }}
+          path: src/out/access-key/
+          if-no-files-found: error
+          retention-days: 14

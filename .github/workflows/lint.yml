@@ -1,0 +1,85 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              shellcheck yamllint
+
+      - name: actionlint
+        run: |
+          url=https://raw.githubusercontent.com/rhysd/actionlint/main
+          url=$url/scripts/download-actionlint.bash
+          bash <(curl -fsSL "$url")
+          ./actionlint -version
+
+      - name: sh -n syntax checks
+        run: |
+          sh -n initramfs/init
+          sh -n initramfs/rootfs-init
+          # rootfs/overlay/usr/local/bin is not tracked (yet), so an unmatched
+          # glob must never be handed to sh(1) as a literal path.
+          files=()
+          for d in rootfs/overlay/usr/lib/piano rootfs/overlay/usr/local/bin; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              [ -f "$f" ] || continue
+              files+=("$f")
+            done
+          done
+          for f in "${files[@]}"; do
+            case $(head -n1 "$f") in
+              *python3*) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$f" ;;
+              *) sh -n "$f" ;;
+            esac
+          done
+          for f in scripts/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: shellcheck
+        run: |
+          shellcheck scripts/*.sh
+          shellcheck -s sh initramfs/rootfs-init
+          files=()
+          for d in rootfs/overlay/usr/lib/piano rootfs/overlay/usr/local/bin; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              [ -f "$f" ] || continue
+              case $(head -n1 "$f") in
+                *python3*) ;;
+                *) files+=("$f") ;;
+              esac
+            done
+          done
+          if [ "${#files[@]}" -gt 0 ]; then
+            shellcheck -s sh "${files[@]}"
+          fi
+          # initramfs/init targets busybox ash (POSIX sh)
+          shellcheck -s sh initramfs/init || {
+            echo "::warning::initramfs/init has shellcheck findings under 'sh' mode";
+          }
+
+      - name: Python compile checks
+        run: |
+          python3 -m py_compile mkbootimg/*.py mkbootimg/gki/*.py
+
+      - name: YAML checks
+        run: |
+          yamllint -d relaxed .github/workflows/
+          ./actionlint

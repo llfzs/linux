@@ -1,0 +1,8 @@
+kernel/
+firmware/
+audioreach-topology/
+v4l2loopback/
+out/
+local/
+refer/
+*.raw.img
