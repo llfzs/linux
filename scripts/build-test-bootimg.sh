@@ -121,7 +121,8 @@ python3 "$MKBOOTIMG" \
 
 # --- dtbo.img: deterministic overlay ------------------------------------------
 echo "build-test-bootimg: building dtbo.img from $DTBO_DTS"
-python3 "$BUILD_DTBO" --dts "$DTBO_DTS" --output "$OUTPUT_DIR/dtbo.img"
+python3 "$BUILD_DTBO" --dts "$DTBO_DTS" --output "$OUTPUT_DIR/dtbo.img" \
+    --kernel-dir "$KERNEL_DIR"
 
 # --- verification --------------------------------------------------------------
 echo "build-test-bootimg: verifying round-trips"
