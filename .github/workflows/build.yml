@@ -90,11 +90,24 @@ jobs:
       - name: Normalize script permissions
         working-directory: src
         run: |
-          # The build invokes these scripts directly and asserts -x on some of
-          # them, so keep them executable even when the tree came from an
-          # upload path that drops the mode bits.
-          chmod +x scripts/*.sh
-          ls -l scripts/build-rootfs-image.sh scripts/fetch-arm64-tools.sh
+          # The build invokes several files directly (and asserts -x on some of
+          # them), so restore the executable mode of every path this repository
+          # tracks as 100755. Uploading the tree through a web UI or an archive
+          # is exactly how those mode bits get lost.
+          exec_paths=(
+            initramfs/init
+            initramfs/rootfs-init
+            initramfs/tests/*
+            rootfs/overlay/usr/lib/piano/*
+            scripts/*.sh
+            scripts/*.py
+            uperf/packaging/debian/*
+          )
+          for f in "${exec_paths[@]}"; do
+            [ -f "$f" ] || continue
+            chmod +x "$f"
+          done
+          ls -l scripts/build-rootfs-image.sh scripts/ext4-to-simg.py scripts/build-dtbo.py
 
       - name: Install build dependencies
         run: |
