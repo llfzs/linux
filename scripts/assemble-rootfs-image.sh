@@ -54,5 +54,7 @@ mkfs.ext4 -F -L piano-root -m 0 -E lazy_itable_init=0,lazy_journal_init=0 \
     -d "$ROOTFS" "$OUTPUT/userdata.raw.img"
 e2fsck -fn "$OUTPUT/userdata.raw.img"
 # Free space must be DONT_CARE, not img2simg FILL chunks (ABL writes FILL slowly).
-"$(dirname "$0")/ext4-to-simg.py" "$OUTPUT/userdata.raw.img" "$OUTPUT/userdata.img"
+# Run through python3 so this helper does not depend on its executable bit,
+# which is easily lost when the tree travels through an archive or the web UI.
+python3 "$(dirname "$0")/ext4-to-simg.py" "$OUTPUT/userdata.raw.img" "$OUTPUT/userdata.img"
 sha256sum "$OUTPUT/userdata.raw.img" "$OUTPUT/userdata.img"
