@@ -3,9 +3,11 @@
 
 Usage:
     scripts/build-dtbo.py [--dts PATH] [--output PATH] [--dtc dtc]
+                          [--kernel-dir PATH]
 
 Compiles debian-piano/boot/dtbo-piano-bringup.dts with `dtc -@` (kernel
-dt-bindings include path resolved from the sibling linux-piano checkout)
+dt-bindings include path taken from --kernel-dir, PIANO_KERNEL_DIR /
+PIANO_KERNEL_INCLUDE, or the kernel checkout found next to this repository)
 and wraps the result in a single-entry big-endian Android DTBO table
 header:
 
@@ -46,6 +48,7 @@ bootloader-chain partitions.
 """
 
 import argparse
+import os
 import struct
 import subprocess
 import sys
@@ -55,8 +58,52 @@ from pathlib import Path
 MAGIC = 0xD7B7AB1E
 
 
-def build(repo: Path, dts: Path, output: Path, dtc: str) -> None:
-    kinc = repo.parent / "kernel" / "include"
+def kernel_include_candidates(repo: Path, kernel_dir) -> "list[Path]":
+    """Every plausible <kernel>/include tree, in priority order.
+
+    An explicit --kernel-dir wins: it may be a kernel source checkout or an
+    O= build tree (kbuild links the source tree as ./source inside it).
+    """
+    cands = []
+
+    def add(path: Path) -> None:
+        if path not in cands:
+            cands.append(path)
+
+    if kernel_dir:
+        kd = Path(kernel_dir).resolve()
+        add(kd / "source" / "include")
+        add(kd / "include")
+    env_dir = os.environ.get("PIANO_KERNEL_DIR")
+    if env_dir:
+        ed = Path(env_dir).resolve()
+        add(ed / "source" / "include")
+        add(ed / "include")
+    env_inc = os.environ.get("PIANO_KERNEL_INCLUDE")
+    if env_inc:
+        add(Path(env_inc).resolve())
+    # Umbrella layouts: in CI this repository is checked out into src/ and the
+    # kernel into src/kernel, so the tree is <repo>/kernel; a local workspace
+    # keeps the kernel next to debian-piano (kernel/ or linux-piano/).
+    for base in (repo, repo.parent):
+        add(base / "kernel" / "include")
+        add(base / "linux-piano" / "include")
+    return cands
+
+
+def resolve_kernel_include(repo: Path, kernel_dir) -> "Path | None":
+    cands = kernel_include_candidates(repo, kernel_dir)
+    for cand in cands:
+        if (cand / "dt-bindings").is_dir():
+            return cand
+    print("build-dtbo: no kernel dt-bindings include tree found; tried:", file=sys.stderr)
+    for cand in cands:
+        print(f"  {cand}", file=sys.stderr)
+    print("build-dtbo: pass --kernel-dir (kernel source or O= build tree)", file=sys.stderr)
+    return None
+
+
+def build(kinc: Path, dts: Path, output: Path, dtc: str) -> None:
     with tempfile.TemporaryDirectory() as td:
         dtb = Path(td) / "overlay.dtb"
         pp = Path(td) / "overlay.pp.dts"
@@ -85,12 +132,19 @@ def main() -> int:
     ap.add_argument("--output", type=Path,
                     default=repo / "out" / "test-image" / "dtbo-piano-bringup.img")
     ap.add_argument("--dtc", default="dtc")
+    ap.add_argument("--kernel-dir", default=None,
+                    help="kernel source checkout or O= build tree holding "
+                         "include/dt-bindings (e.g. the --kernel-dir of "
+                         "scripts/build-test-bootimg.sh)")
     args = ap.parse_args()
     if not args.dts.is_file():
         print(f"build-dtbo: missing overlay source {args.dts}", file=sys.stderr)
         return 1
+    kinc = resolve_kernel_include(repo, args.kernel_dir)
+    if kinc is None:
+        return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    build(repo, args.dts, args.output, args.dtc)
+    build(kinc, args.dts, args.output, args.dtc)
     return 0
 
 
