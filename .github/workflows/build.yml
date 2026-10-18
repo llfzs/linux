@@ -355,10 +355,21 @@ jobs:
         run: |
           tag="${GITHUB_REF##*/}"
           cd src/out
+          # bundle/ and rootfs-tar/ both ship a SHA256SUMS — asset names must
+          # be unique inside one release, so rename the rootfs one.
+          if [ -f rootfs-tar/SHA256SUMS ]; then
+            mv rootfs-tar/SHA256SUMS rootfs-tar/rootfs-SHA256SUMS.txt
+          fi
           echo ">> publishing release: $tag"
+          # Create the release without assets first; tolerate it already
+          # existing (re-runs of a half-published release are expected).
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "piano GNOME image $tag" \
             --notes-file bundle/MANIFEST.txt \
-            bundle/* rootfs-tar/* \
-          || gh release upload "$tag" --clobber bundle/* rootfs-tar/*
+          || true
+          # Idempotent asset upload: --clobber overwrites same-named assets.
+          gh release upload "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            bundle/* rootfs-tar/*
