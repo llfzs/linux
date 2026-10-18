@@ -1,0 +1,157 @@
+name: partition-env
+
+# Standalone workflow for the partition-rescue image:
+#   in  : this repo (llfzs/linux fork with partition-env/ added) + kernel
+#   out : partition-boot.img + dtbo.img (+MANIFEST) as a 14-day artifact
+#
+# Manual run: Actions tab -> partition-env -> Run workflow (pick kernel_ref).
+# Path filter keeps pushes cheap: only rebuilds when partition-env changes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: 'code002-2/linux ref to build against'
+        default: piano-7.2.6
+        required: true
+  push:
+    branches: [main]
+    paths:
+      - 'partition-env/**'
+      - '.github/workflows/partition-env.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: partition-env-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm      # native arm64: tools are directly usable
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v5
+        with:
+          path: src
+          persist-credentials: false
+
+      - name: Checkout the kernel
+        uses: actions/checkout@v5
+        with:
+          repository: code002-2/linux
+          ref: ${{ github.event.inputs.kernel_ref || 'piano-7.2.6' }}
+          path: src/kernel
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              clang lld llvm ccache make flex bison bc libssl-dev libelf-dev \
+              device-tree-compiler build-essential rsync cpio kmod python3 \
+              busybox-static sgdisk e2fsprogs file
+
+      - name: Normalize script permissions
+        working-directory: src
+        run: |
+          # Web-UI uploads lose the executable bit; restore what we invoke.
+          chmod +x partition-env/build-partition-image.sh partition-env/pianoinit \
+                 scripts/fetch-arm64-tools.sh scripts/build-dtbo.py 2>/dev/null || true
+          ls -l partition-env/
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: partition-env-clang-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            partition-env-clang-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fetch the arm64 tool bits
+        working-directory: src
+        run: |
+          scripts/fetch-arm64-tools.sh --output-dir out/arm64-tools
+
+      - name: Locate piano-qup-smmu
+        id: smmu
+        working-directory: src
+        run: |
+          p=$(find out/arm64-tools rootfs -type f -name piano-qup-smmu 2>/dev/null | head -n 1)
+          if [ -z "$p" ]; then
+            echo "piano-qup-smmu not found in out/arm64-tools or rootfs/" >&2
+            echo "It is a hard prerequisite for the UFS DMA path." >&2
+            exit 1
+          fi
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "found: $p"
+
+      - name: Stage the partition toolset (arm64 native)
+        run: |
+          set -e
+          mkdir -p tools/bin tools/lib/aarch64-linux-gnu
+          # busybox-static package: /bin/busybox is statically linked
+          cp /bin/busybox tools/bin/busybox
+          for b in sgdisk mkfs.ext4 e2fsck resize2fs; do
+            cp "$(command -v "$b")" tools/bin/
+          done
+          # shared-library closure with the Debian arm64 layout the loader expects
+          for b in tools/bin/sgdisk tools/bin/mkfs.ext4 tools/bin/e2fsck tools/bin/resize2fs; do
+            ldd "$b" | grep -oE '/[^[:space:]]+\.so[^[:space:]]*' || true
+          done | sort -u | while read -r so; do
+            case "$so" in
+              *aarch64-linux-gnu*) cp "$so" tools/lib/aarch64-linux-gnu/ ;;
+              *)                   cp "$so" tools/lib/ ;;
+            esac
+          done
+          cp /lib/ld-linux-aarch64.so.1 tools/lib/
+          echo "--- staged tools ---"
+          file tools/bin/* tools/lib/ld-linux-aarch64.so.1 | sed 's/^/  /'
+
+      - name: Build dtbo (rootfs overlay)
+        working-directory: src
+        run: |
+          python3 scripts/build-dtbo.py \
+            --dts boot/dtbo-piano-rootfs.dts \
+            --output out/dtbo.img \
+            --kernel-dir kernel
+
+      - name: Build the partition-rescue boot image
+        working-directory: src
+        run: |
+          partition-env/build-partition-image.sh \
+            --repo-root "$PWD" \
+            --kernel-src kernel \
+            --busybox "$GITHUB_WORKSPACE/tools/bin/busybox" \
+            --smmu-tool "${{ steps.smmu.outputs.path }}" \
+            --tools-dir "$GITHUB_WORKSPACE/tools" \
+            --dtbo out/dtbo.img \
+            --jobs "$(nproc)"
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: partition-env-clang-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload the partition-rescue image
+        uses: actions/upload-artifact@v4
+        with:
+          name: partition-env-${{ github.sha }}
+          path: |
+            src/out/partition-image/partition-boot.img
+            src/out/partition-image/dtbo.img
+            src/out/partition-image/MANIFEST.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
