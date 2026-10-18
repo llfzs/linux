@@ -1,0 +1,185 @@
+#!/bin/sh
+# pianoinit — partition-rescue initramfs entry (installed as /pianoinit)
+# Profile: partition-rescue
+#
+# Base: llfzs/linux initramfs/rootfs-init (SMMU/UFS sequence preserved verbatim)
+# Changes vs rootfs-init:
+#   - removed: root= validation, userdata ext4 mount, switch_root handoff
+#   - added  : inline USB-NCM gadget (no /usr/lib/piano/usb-network dependency),
+#             block device inventory, persistent interactive shell
+#   - POLICY : this script itself performs NO persistent writes. All partition
+#     modifications must be issued interactively by the operator.
+#   (This profile deliberately departs from the repo's "init never writes"
+#    audit line; the departure is documented here for auditability.)
+#
+# Requires in initramfs: /bin/busybox (static), piano-qup-smmu on PATH,
+# kernel modules phy_qcom_qmp_ufs + ufs_qcom under /lib/modules/$(uname -r).
+# Optional: /bin/dropbear (+ keys) for SSH; sgdisk/e2fsprogs for partitioning.
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+# dynamic tool closure (sgdisk/e2fsprogs from CI) lands in /lib and /usr/lib
+export LD_LIBRARY_PATH=/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+/bin/busybox --install -s /bin
+
+mkdir -p /dev /proc /sys /run /tmp /config /mnt
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755 tmpfs /run
+
+log() {
+    echo "piano: $*" | tee -a /run/piano-boot.log
+    [ ! -c /dev/kmsg ] || echo "<3>piano: $*" > /dev/kmsg
+}
+
+rescue_shell() {
+    log "RESCUE: $*"
+    echo "$*" > /run/rootfs-error
+    while :; do setsid cttyhack /bin/sh; sleep 1; done
+}
+
+# ---------------------------------------------------------------- USB NCM ---
+# Inline NCM gadget; host side: static 10.42.0.1/24 (repo-verified pattern).
+# Best effort — never blocks the storage bring-up (rootfs-init lesson).
+setup_ncm() {
+    [ -d /sys/class/udc ] || return 1
+    mount -t configfs configfs /config 2>/dev/null || true
+    mkdir -p /config/usb_gadget/g1 || return 1
+    cd /config/usb_gadget/g1 || return 1
+    echo 0x18d1 > idVendor       || return 1
+    echo 0xd002 > idProduct      || return 1
+    mkdir -p strings/0x409
+    echo "0000000000000" > strings/0x409/serialnumber 2>/dev/null
+    echo "Piano"         > strings/0x409/product 2>/dev/null
+    echo "PianoLin"      > strings/0x409/manufacturer 2>/dev/null
+    mkdir -p functions/ncm.usb0
+    # fixed test MACs (repo policy for deterministic host configs)
+    echo "42:50:69:61:6e:6f" > functions/ncm.usb0/dev_addr  2>/dev/null
+    echo "42:50:69:61:6e:70" > functions/ncm.usb0/host_addr 2>/dev/null
+    mkdir -p configs/b.1/strings/0x409
+    echo "ncm" > configs/b.1/strings/0x409/configuration 2>/dev/null
+    ln -s functions/ncm.usb0 configs/b.1 2>/dev/null || true
+    _udc=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+    [ -n "$_udc" ] || return 1
+    echo "$_udc" > UDC || return 1
+    sleep 2
+    ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up || return 1
+    cd /
+    return 0
+}
+
+start_ssh() {
+    command -v dropbear >/dev/null 2>&1 || return 1
+    mkdir -p /etc/dropbear
+    [ -s /etc/dropbear/dropbear_ed25519_host_key ] ||
+        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null ||
+        return 1
+    dropbear -s -j -k -E -p 10.42.0.2:22 -P /run/piano-dropbear.pid \
+        2>>/run/piano-dropbear.log
+}
+
+log 'INIT: partition-rescue profile (rdinit=/pianoinit)'
+
+if setup_ncm; then
+    log 'NCM_READY: usb0=10.42.0.2/24; host should use 10.42.0.1/24'
+    telnetd 2>/dev/null
+    if start_ssh; then
+        log 'SSH_READY: ssh root@10.42.0.2'
+    else
+        log 'WARN: dropbear unavailable; use: nc 10.42.0.2 23'
+    fi
+else
+    log 'WARN: USB NCM unavailable (see /run/piano-boot.log); continuing'
+fi
+
+# ------------------------------------------------------ SMMU then UFS path ---
+# Sequence copied verbatim from rootfs-init (device-validated ordering).
+log 'BEGIN smmu'
+if command -v piano-qup-smmu >/dev/null 2>&1; then
+    piano-qup-smmu 0xb6 0xa3 0x1400/0x7f 0x436 0x423 0x60 \
+        > /run/qup-smmu.log 2>&1 ||
+        rescue_shell 'SMMU repair failed; UFS DMA path unavailable'
+    # ADSP DMA streams — non-fatal (only audio/sensors would fault)
+    piano-qup-smmu 0x1001/0x80 0x1041/0x20 \
+        0x1003/0x80 0x1043/0x20 0x1004/0x80 0x1044/0x20 \
+        0x1005/0x80 0x1045/0x20 0x1006/0x80 0x1046/0x20 \
+        0x1007/0x40 0x1067 0x1087 0x1008/0x80 0x1048/0x20 \
+        >> /run/qup-smmu.log 2>&1 ||
+        log 'WARN ADSP SMMU stream matches failed (non-fatal)'
+    log 'DONE smmu'
+else
+    log 'WARN piano-qup-smmu not on PATH; UFS may fail to probe'
+fi
+
+log 'BEGIN ufs-clkref'
+# Stock TCSR base 0x0f204008 + upstream UFS CLKREF offset 0x1000.
+# Copied verbatim from rootfs-init; do NOT scan neighbouring registers.
+v=$(devmem 0x0f205008 32) || rescue_shell 'cannot read UFS reference clock'
+devmem 0x0f205008 32 "$((v | 1))" || rescue_shell 'cannot enable UFS reference clock'
+log 'DONE ufs-clkref'
+
+log 'BEGIN ufs modules'
+modprobe phy_qcom_qmp_ufs 2>>/run/piano-boot.log ||
+    rescue_shell 'UFS PHY module failed'
+modprobe ufs_qcom 2>>/run/piano-boot.log ||
+    rescue_shell 'UFS host module failed'
+log 'DONE ufs modules (probe may be deferred)'
+
+# --------------------------------------------------- wait for UFS blocks ---
+_n=0
+while [ "$_n" -lt 90 ]; do
+    [ -e /sys/block/sda ] && break
+    sleep 1
+    _n=$((_n + 1))
+done
+[ -e /sys/block/sda ] || rescue_shell 'UFS did not appear within 90 seconds'
+
+log 'DONE storage: /dev/sda present'
+
+# ------------------------------------------------------------ inventory ---
+echo '' > /run/partmap.txt
+for _p in /sys/class/block/sda*; do
+    _part=0
+    [ -f "$_p/partition" ] && _part=1
+    _name=$(cat "$_p/uevent" 2>/dev/null | grep '^PARTNAME=' | cut -d= -f2)
+    _dev=/dev/${_p##*/}
+    if [ "$_part" = 1 ]; then
+        echo "$_dev PARTNAME=${_name:-<none>}" >> /run/partmap.txt
+    else
+        echo "$_dev (whole disk)" >> /run/partmap.txt
+    fi
+done
+
+echo ''
+echo '=============================================================='
+echo ' piano partition-rescue — interactive profile'
+echo '=============================================================='
+echo ' remote : ssh root@10.42.0.2   (host: 10.42.0.1/24)'
+echo '          or: nc 10.42.0.2 23'
+echo ' storage inventory (/run/partmap.txt):'
+cat /run/partmap.txt
+echo '--------------------------------------------------------------'
+if command -v sgdisk >/dev/null 2>&1; then
+    echo ' current GPT:'
+    sgdisk -p /dev/sda 2>/dev/null | sed 's/^/   /'
+    echo '--------------------------------------------------------------'
+    echo ' FIRST ACTION — back up the GPT to the host:'
+    echo "   ssh root@10.42.0.2 'dd if=/dev/sda bs=512 count=34'" \
+         "| dd of=gpt-head.bin"
+    echo '   (also save the last 33 sectors for the backup GPT)'
+else
+    echo ' WARNING: sgdisk NOT present in this initramfs.'
+    echo ' You can inspect, but not repartition. Rebuild with tools.'
+fi
+echo ' This shell performs no automatic writes. GPT surgery is yours.'
+echo '=============================================================='
+log 'PARTITION-RESCUE READY (interactive shell)'
+
+# respawn shell forever (console + telnet sessions)
+while :; do
+    setsid cttyhack /bin/sh
+    sleep 1
+done
