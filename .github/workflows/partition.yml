@@ -1,4 +1,4 @@
-name: partition-env
+name: partition
 
 # Standalone workflow for the partition-rescue image:
 #   in  : this repo (llfzs/linux fork with partition-env/ added) + kernel
