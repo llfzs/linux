@@ -166,6 +166,8 @@ jobs:
             --notes "piano partition-rescue image (RAM-boot GPT environment).
           See MANIFEST.txt for kernel ref, tool list and on-device usage.
           Flash order: fastboot set_active b && fastboot flash dtbo_b dtbo.img && fastboot boot partition-boot.img" \
-            partition-boot.img dtbo.img MANIFEST.txt \
-          || gh release upload "$tag" --clobber \
+          || true
+          gh release upload "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
             partition-boot.img dtbo.img MANIFEST.txt
