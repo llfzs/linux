@@ -168,10 +168,18 @@ echo ">> preparing kernel config (INITRAMFS_SOURCE=$STAGING)"
     $KMAKE ARCH=arm64 olddefconfig >/dev/null
 )
 
-# modules first: modules_install populates $STAGING/lib/modules,
-# then the Image build embeds the finished staging tree.
-echo ">> building modules"
-$KMAKE -C "$KERNEL_SRC" ARCH=arm64 -j"$JOBS" modules >/dev/null
+# Two-pass build:
+#   pass 1: Image + modules together — generates modules.builtin and
+#           include/config/kernel.release, both required by modules_install
+#           (a bare `make modules` produces neither, and modules_install
+#           then fails with "No rule to make target 'modules.builtin'").
+#   install: modules_install populates $STAGING/lib/modules.
+#   pass 2: re-link Image so the embedded initramfs (CONFIG_INITRAMFS_SOURCE
+#           → $STAGING) contains those modules. The initramfs intermediates
+#           are removed first — kbuild does not track staging tree content
+#           changes on its own.
+echo ">> building Image + modules (pass 1)"
+$KMAKE -C "$KERNEL_SRC" ARCH=arm64 -j"$JOBS" Image modules >/dev/null
 echo ">> installing modules into staging"
 $KMAKE -C "$KERNEL_SRC" ARCH=arm64 INSTALL_MOD_PATH="$STAGING" \
     modules_install >/dev/null
@@ -179,7 +187,8 @@ $KMAKE -C "$KERNEL_SRC" ARCH=arm64 INSTALL_MOD_PATH="$STAGING" \
 KVER=$(make -s -C "$KERNEL_SRC" ARCH=arm64 kernelrelease)
 rm -f "$STAGING/lib/modules/$KVER/build" "$STAGING/lib/modules/$KVER/source"
 
-echo ">> building Image (kernel $KVER, initramfs embedded, LLVM=$USE_LLVM)"
+echo ">> rebuilding Image (pass 2, kernel $KVER, initramfs with modules)"
+find "$KERNEL_SRC/usr" -maxdepth 1 -name 'initramfs_data*' -delete 2>/dev/null || true
 $KMAKE -C "$KERNEL_SRC" ARCH=arm64 -j"$JOBS" Image >/dev/null
 IMAGE="$KERNEL_SRC/arch/arm64/boot/Image"
 [ -f "$IMAGE" ] || die "Image missing after build"
