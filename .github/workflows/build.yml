@@ -1,5 +1,6 @@
 name: build
 
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,14 +14,18 @@ on:
         required: true
   push:
     branches: [main]
+    tags: ['piano-v*']
+
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: false
 
+
 permissions:
-  contents: read
+  contents: write
   actions: write
+
 
 jobs:
   build:
@@ -54,6 +59,7 @@ jobs:
           path: src
           persist-credentials: false
 
+
       - name: Checkout the kernel
         uses: actions/checkout@v5
         with:
@@ -63,6 +69,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+
       - name: Checkout piano firmware
         uses: actions/checkout@v5
         with:
@@ -70,6 +77,7 @@ jobs:
           ref: main
           path: src/firmware
           persist-credentials: false
+
 
       - name: Checkout AudioReach topology macros
         uses: actions/checkout@v5
@@ -79,6 +87,7 @@ jobs:
           path: src/audioreach-topology
           persist-credentials: false
 
+
       - name: Checkout v4l2loopback
         uses: actions/checkout@v5
         with:
@@ -87,13 +96,14 @@ jobs:
           path: src/v4l2loopback
           persist-credentials: false
 
+
       - name: Normalize script permissions
         working-directory: src
         run: |
-          # The build invokes several files directly (and asserts -x on some of
-          # them), so restore the executable mode of every path this repository
-          # tracks as 100755. Uploading the tree through a web UI or an archive
-          # is exactly how those mode bits get lost.
+          # The build invokes several files directly (and asserts -x on some
+          # of them), so restore the executable mode of every path this
+          # repository tracks as 100755. Uploading the tree through a web UI
+          # or an archive is exactly how those mode bits get lost.
           exec_paths=(
             initramfs/init
             initramfs/rootfs-init
@@ -241,6 +251,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+
       - name: Package the flashable set and the rootfs tarball
         working-directory: src
         run: |
@@ -283,6 +294,7 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+
       - name: Prune this ref's older compiler caches
         if: always()
         env:
@@ -299,6 +311,7 @@ jobs:
           path: .ccache
           key: piano-clang-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+
       - name: Upload the flashable set
         uses: actions/upload-artifact@v4
         with:
@@ -307,6 +320,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
 
       - name: Upload the rootfs tarball
         uses: actions/upload-artifact@v4
@@ -317,6 +331,7 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+
       - name: Upload the ephemeral access key
         if: ${{ vars.PIANO_SSH_PUBLIC_KEY == '' }}
         uses: actions/upload-artifact@v4
@@ -325,3 +340,25 @@ jobs:
           path: src/out/access-key/
           if-no-files-found: error
           retention-days: 14
+
+
+      # ------------------------------------------------------------------
+      # Release channel (added): publish the image set on a piano-v* tag.
+      # Release assets need no login to download and never expire.
+      # The ephemeral access key stays in the 14-day artifact on purpose:
+      # releases are fully public, artifacts require a GitHub account.
+      # ------------------------------------------------------------------
+      - name: Create GitHub Release with the image set
+        if: startsWith(github.ref, 'refs/tags/piano-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF##*/}"
+          cd src/out
+          echo ">> publishing release: $tag"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "piano GNOME image $tag" \
+            --notes-file bundle/MANIFEST.txt \
+            bundle/* rootfs-tar/* \
+          || gh release upload "$tag" --clobber bundle/* rootfs-tar/*
