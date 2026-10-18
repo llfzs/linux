@@ -82,14 +82,17 @@ jobs:
         id: smmu
         working-directory: src
         run: |
-          p=$(find out/arm64-tools rootfs -type f -name piano-qup-smmu 2>/dev/null | head -n 1)
+          # Lives at initramfs/tests/piano-qup-smmu in the upstream repo
+          # (build-initramfs.sh installs only this one test into rootfs images).
+          p=$(find out/arm64-tools rootfs initramfs -type f -name piano-qup-smmu 2>/dev/null | head -n 1)
           if [ -z "$p" ]; then
-            echo "piano-qup-smmu not found in out/arm64-tools or rootfs/" >&2
+            echo "piano-qup-smmu not found in out/arm64-tools, rootfs/ or initramfs/" >&2
             echo "It is a hard prerequisite for the UFS DMA path." >&2
             exit 1
           fi
           echo "path=$p" >> "$GITHUB_OUTPUT"
           echo "found: $p"
+          file "$p" || true
 
       - name: Stage the partition toolset (arm64 native)
         run: |
