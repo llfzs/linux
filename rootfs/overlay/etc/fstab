@@ -1,1 +1,1 @@
-PARTLABEL=userdata / ext4 defaults,noatime,x-systemd.growfs 0 1
+PARTLABEL=linux / ext4 defaults,noatime,x-systemd.growfs 0 1
