@@ -123,8 +123,15 @@ fi
     echo "WARNING: no sgdisk staged — image will be inspect-only" >&2
 
 if [ -n "$DROPBEAR_TREE" ]; then
-    cp -a "$DROPBEAR_TREE/." "$STAGING/" ||
-        die "failed to copy dropbear tree"
+    # Some aarch64 tool trees provide /lib as a symlink into /usr/lib
+    # (upstream build-initramfs.sh handles it the same way): copy the usr
+    # tree verbatim, then dereference lib into a REAL directory so kernel
+    # modules and the loader stay discoverable in the initramfs.
+    [ -d "$DROPBEAR_TREE/usr" ] || die "dropbear tree has no usr/ dir: $DROPBEAR_TREE"
+    cp -a "$DROPBEAR_TREE/usr" "$STAGING/"
+    mkdir -p "$STAGING/lib"
+    cp -aL "$DROPBEAR_TREE/lib/." "$STAGING/lib/" ||
+        die "failed to copy dropbear lib closure"
 fi
 
 # ------------------------------------------------------------- kernel config --
