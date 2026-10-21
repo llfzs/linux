@@ -154,19 +154,12 @@ echo ">> config: piano_defconfig + $FRAGMENT fragment (upstream path)"
         cat "arch/arm64/configs/${FRAGMENT}.config" >> "$KBUILD_OUT/.config"
     fi
     "${KMAKE[@]}" olddefconfig >/dev/null
-    # embed the partition initramfs
-    if [ -x ./scripts/config ]; then
-        ./scripts/config --file "$KBUILD_OUT/.config" \
-            --set-str CONFIG_INITRAMFS_SOURCE "$STAGING"
-    else
-        sed -i "/CONFIG_INITRAMFS_SOURCE/d" "$KBUILD_OUT/.config"
-        echo "CONFIG_INITRAMFS_SOURCE=\"$STAGING\"" >> "$KBUILD_OUT/.config"
-    fi
     "${KMAKE[@]}" olddefconfig >/dev/null
-    # hard gates from the upstream build
+    # hard gates from the upstream build (+ RD_GZIP for the cpio.gz below)
     for opt in CONFIG_CMDLINE_FORCE=y CONFIG_EXT4_FS=y CONFIG_DRM_SIMPLEDRM=y \
                CONFIG_SCSI_UFSHCD=m CONFIG_SCSI_UFS_QCOM=m \
-               CONFIG_PHY_QCOM_QMP_UFS=m CONFIG_USB_CONFIGFS_NCM=y; do
+               CONFIG_PHY_QCOM_QMP_UFS=m CONFIG_USB_CONFIGFS_NCM=y \
+               CONFIG_RD_GZIP=y; do
         grep -qxF "$opt" "$KBUILD_OUT/.config" ||
             { echo "Required: $opt" >&2; exit 1; }
     done
@@ -200,7 +193,26 @@ done
     die "UFS module closure is empty"
 depmod -b "$STAGING" "$KVER" || die "depmod failed"
 
-echo ">> rebuilding Image (pass 2, $KVER, initramfs with UFS closure)"
+# ------------------------------------------------- pack initramfs (upstream style) --
+# v4 bug: INITRAMFS_SOURCE pointed at the staging DIRECTORY and the kernel
+# ended up without /pianoinit ("Failed to execute /pianoinit (error -2)").
+# Upstream embeds a pre-packed cpio.gz FILE instead — do exactly that, and
+# assert the entry point is really inside the archive.
+INITRAMFS="$REPO_ROOT/out/partition-initramfs.cpio.gz"
+echo ">> packing initramfs cpio.gz"
+( cd "$STAGING" && find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null ) \
+    | gzip -9 > "$INITRAMFS"
+zcat "$INITRAMFS" | cpio -t 2>/dev/null | grep -qx 'pianoinit' ||
+    die "/pianoinit missing from the packed initramfs"
+echo ">> initramfs OK ($(du -h "$INITRAMFS" | cut -f1)), entry verified"
+
+( cd "$KERNEL_SRC"
+  ./scripts/config --file "$KBUILD_OUT/.config" \
+      --set-str CONFIG_INITRAMFS_SOURCE "$INITRAMFS"
+  "${KMAKE[@]}" olddefconfig >/dev/null
+)
+
+echo ">> rebuilding Image (pass 2, $KVER, initramfs cpio.gz embedded)"
 find "$KBUILD_OUT/usr" -maxdepth 1 -name 'initramfs_data*' -delete 2>/dev/null || true
 "${KMAKE[@]}" -j"$JOBS" Image >/dev/null
 IMAGE="$KBUILD_OUT/arch/arm64/boot/Image"
