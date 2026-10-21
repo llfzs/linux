@@ -60,8 +60,15 @@ done
 die() { echo "build-partition-image: $*" >&2; exit 1; }
 
 [ -n "$REPO_ROOT" ] || die "cannot locate repo root (no mkbootimg/); pass --repo-root"
+# kbuild requires an ABSOLUTE O= path: a relative one is resolved against the
+# directory after make -C, silently breaking srctree detection (symptom:
+# "No rule to make target 'piano_defconfig'"). Normalize everything.
+KERNEL_SRC=$(realpath -m "${KERNEL_SRC:?}")
+REPO_ROOT=$(realpath -m "$REPO_ROOT")
 OUT=${OUT:-$REPO_ROOT/out/partition-image}
 STAGING=${STAGING:-$REPO_ROOT/out/partition-staging}
+OUT=$(realpath -m "$OUT")
+STAGING=$(realpath -m "$STAGING")
 
 [ -n "$KERNEL_SRC" ] || die "--kernel-src required"
 [ -d "$KERNEL_SRC" ] || die "kernel src not found: $KERNEL_SRC"
