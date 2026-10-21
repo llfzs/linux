@@ -116,6 +116,21 @@ install -m 0755 "$HERE/pianoinit" "$STAGING/pianoinit"
 install -m 0755 "$BUSYBOX"        "$STAGING/bin/busybox"
 install -m 0755 "$SMMU_TOOL"      "$STAGING/bin/piano-qup-smmu"
 
+# THE v5 FIX — pianoinit's shebang is #!/bin/sh, and its own
+# `busybox --install -s /bin` can never run before that shell exists
+# (execve("/pianoinit") → binfmt_script → execve("/bin/sh") → ENOENT = -2).
+# Pre-create the minimal symlink set at build time, exactly like the
+# upstream scripts/build-initramfs.sh does for /init.
+for cmd in sh mount mkdir ln echo cat ls modprobe; do
+    ln -sf /bin/busybox "$STAGING/bin/$cmd"
+done
+
+# Silence "unable to open an initial console": the initramfs needs a
+# /dev/console node until pianoinit mounts devtmpfs (best effort; the
+# archive is --owner=0:0 anyway).
+sudo mknod -m 600 "$STAGING/dev/console" c 5 1 2>/dev/null || true
+sudo mknod -m 666 "$STAGING/dev/null"    c 1 3 2>/dev/null || true
+
 if [ -d "$TOOLS_DIR/bin" ]; then
     find "$TOOLS_DIR/bin" -maxdepth 1 -type f -print0 |
     while IFS= read -r -d '' f; do install -m 0755 "$f" "$STAGING/bin/"; done
@@ -202,14 +217,25 @@ INITRAMFS="$REPO_ROOT/out/partition-initramfs.cpio.gz"
 echo ">> packing initramfs cpio.gz"
 ( cd "$STAGING" && find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null ) \
     | gzip -9 > "$INITRAMFS"
-zcat "$INITRAMFS" | cpio -t 2>/dev/null | grep -qx 'pianoinit' ||
-    die "/pianoinit missing from the packed initramfs"
-echo ">> initramfs OK ($(du -h "$INITRAMFS" | cut -f1)), entry verified"
+# v5 assertion: the entry point AND its interpreter/early tools must be in
+# the archive — checking only pianoinit produced "green CI + broken image".
+_members=$(zcat "$INITRAMFS" | cpio -t 2>/dev/null)
+for need in pianoinit bin/busybox bin/sh bin/mount bin/mkdir bin/modprobe; do
+    printf '%s\n' "$_members" | grep -qx "$need" ||
+        die "/$need missing from the initramfs — pianoinit would fail with ENOENT"
+done
+echo ">> initramfs OK ($(du -h "$INITRAMFS" | cut -f1)), entry + interpreter verified"
 
 ( cd "$KERNEL_SRC"
   ./scripts/config --file "$KBUILD_OUT/.config" \
       --set-str CONFIG_INITRAMFS_SOURCE "$INITRAMFS"
   "${KMAKE[@]}" olddefconfig >/dev/null
+  # INITRAMFS_SOURCE is a string symbol gated on BLK_DEV_INITRD: if that is
+  # off, olddefconfig silently drops it and no initramfs gets embedded.
+  grep -qxF 'CONFIG_BLK_DEV_INITRD=y' "$KBUILD_OUT/.config" ||
+      { echo "CONFIG_BLK_DEV_INITRD is off" >&2; exit 1; }
+  grep -qF "CONFIG_INITRAMFS_SOURCE=\"$INITRAMFS\"" "$KBUILD_OUT/.config" ||
+      { echo "CONFIG_INITRAMFS_SOURCE did not survive olddefconfig" >&2; exit 1; }
 )
 
 echo ">> rebuilding Image (pass 2, $KVER, initramfs cpio.gz embedded)"
