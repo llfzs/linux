@@ -1,11 +1,9 @@
 name: partition
 
-# Standalone workflow for the partition-rescue image:
-#   in  : this repo (llfzs/linux fork with partition-env/ added) + kernel
-#   out : partition-boot.img + dtbo.img (+MANIFEST) as a 14-day artifact
+# Standalone workflow for the partition-rescue image.
+# Manual-only: every successful run publishes a Release (tag: partition-ci-<sha>).
 #
 # Manual run: Actions tab -> partition-env -> Run workflow (pick kernel_ref).
-# Path filter keeps pushes cheap: only rebuilds when partition-env changes.
 
 on:
   workflow_dispatch:
@@ -14,17 +12,6 @@ on:
         description: 'code002-2/linux ref to build against'
         default: piano-7.2.6
         required: true
-      publish:
-        description: 'Also publish a draft release (tag: partition-ci-<sha>)'
-        type: boolean
-        default: false
-  push:
-    branches: [main]
-    paths:
-      - 'partition-env/**'
-      - '.github/workflows/partition-env.yml'
-    tags:
-      - 'partition-v*'
 
 permissions:
   contents: write          # required to create releases
@@ -167,24 +154,21 @@ jobs:
           compression-level: 0
           retention-days: 14
 
-      # Release assets: no login required to download, no expiry.
-      # Triggers: a pushed partition-v* tag, or workflow_dispatch with publish=true.
-      - name: Create GitHub Release with the images
-        if: >-
-          startsWith(github.ref, 'refs/tags/partition-v') ||
-          (github.event_name == 'workflow_dispatch' && inputs.publish)
+      # ------------------------------------------------------------------
+      # Release channel: EVERY manual build publishes a Release.
+      # Tag is auto-generated (partition-ci-<sha>) and points at the built
+      # commit. Release assets need no login to download and never expire.
+      # ------------------------------------------------------------------
+      - name: Publish to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            tag="${GITHUB_REF##*/}"
-          else
-            tag="partition-ci-${GITHUB_SHA::12}"
-          fi
+          tag="partition-ci-${GITHUB_SHA::12}"
           cd src/out/partition-image
           echo ">> publishing release: $tag"
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "partition-env $tag" \
             --notes "piano partition-rescue image (RAM-boot GPT environment).
           See MANIFEST.txt for kernel ref, tool list and on-device usage.

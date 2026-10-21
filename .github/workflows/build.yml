@@ -1,6 +1,7 @@
 name: build
 
 
+# Manual-only: every successful run publishes a Release (tag: piano-ci-<sha>).
 on:
   workflow_dispatch:
     inputs:
@@ -12,9 +13,6 @@ on:
         description: 'expanded userdata size'
         default: 12G
         required: true
-  push:
-    branches: [main]
-    tags: ['piano-v*']
 
 
 concurrency:
@@ -343,17 +341,17 @@ jobs:
 
 
       # ------------------------------------------------------------------
-      # Release channel (added): publish the image set on a piano-v* tag.
+      # Release channel: EVERY manual build publishes a Release.
+      # Tag is auto-generated (piano-ci-<sha>) and points at the built commit.
       # Release assets need no login to download and never expire.
       # The ephemeral access key stays in the 14-day artifact on purpose:
       # releases are fully public, artifacts require a GitHub account.
       # ------------------------------------------------------------------
-      - name: Create GitHub Release with the image set
-        if: startsWith(github.ref, 'refs/tags/piano-v')
+      - name: Publish to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF##*/}"
+          tag="piano-ci-${GITHUB_SHA::12}"
           cd src/out
           # bundle/ and rootfs-tar/ both ship a SHA256SUMS — asset names must
           # be unique inside one release, so rename the rootfs one.
@@ -361,14 +359,12 @@ jobs:
             mv rootfs-tar/SHA256SUMS rootfs-tar/rootfs-SHA256SUMS.txt
           fi
           echo ">> publishing release: $tag"
-          # Create the release without assets first; tolerate it already
-          # existing (re-runs of a half-published release are expected).
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "piano GNOME image $tag" \
             --notes-file bundle/MANIFEST.txt \
           || true
-          # Idempotent asset upload: --clobber overwrites same-named assets.
           gh release upload "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
