@@ -112,17 +112,39 @@ jobs:
           echo "--- staged tools ---"
           file tools/bin/* tools/lib/ld-linux-aarch64.so.1 | sed 's/^/  /'
 
-      - name: Build dtbo (rootfs overlay)
+      - name: Build dtbo (rootfs overlay — upstream source!)
         working-directory: src
         run: |
+          # MUST match upstream build-rootfs-image.sh:
+          #   build-test-bootimg.sh … --dtbo-source boot/dtbo-piano-power.dts --mode rootfs
+          # (dtbo-piano-rootfs.dts is UFS-only and lacks the nodes USB/display need.)
           python3 scripts/build-dtbo.py \
-            --dts boot/dtbo-piano-rootfs.dts \
+            --dts boot/dtbo-piano-power.dts \
             --output out/dtbo.img \
             --kernel-dir kernel
+
+      - name: Locate the dropbear tool tree
+        id: dropbear
+        working-directory: src
+        run: |
+          # fetch-arm64-tools stages a Debian-style tree with usr/sbin/dropbear
+          db=$(find out/arm64-tools -type f -path '*/usr/sbin/dropbear' 2>/dev/null | head -n 1)
+          if [ -z "$db" ]; then
+            echo "dropbear tree not found; image will be telnet-only" >&2
+            echo "tree=" >> "$GITHUB_OUTPUT"
+          else
+            tree=$(dirname "$(dirname "$(dirname "$db")")")   # …/usr/sbin/dropbear → tree root
+            echo "tree=$tree" >> "$GITHUB_OUTPUT"
+            echo "found: $tree"
+          fi
 
       - name: Build the partition-rescue boot image
         working-directory: src
         run: |
+          opt_dropbear=()
+          if [ -n "${{ steps.dropbear.outputs.tree }}" ]; then
+            opt_dropbear=(--dropbear-tree "${{ steps.dropbear.outputs.tree }}")
+          fi
           partition-env/build-partition-image.sh \
             --repo-root "$PWD" \
             --kernel-src kernel \
@@ -130,7 +152,8 @@ jobs:
             --smmu-tool "${{ steps.smmu.outputs.path }}" \
             --tools-dir "$GITHUB_WORKSPACE/tools" \
             --dtbo out/dtbo.img \
-            --jobs "$(nproc)"
+            --jobs "$(nproc)" \
+            "${opt_dropbear[@]}"
 
       - name: Upload the partition-rescue image (14-day artifact)
         uses: actions/upload-artifact@v4

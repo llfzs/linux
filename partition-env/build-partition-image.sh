@@ -1,43 +1,24 @@
 #!/usr/bin/env bash
 # build-partition-image.sh — piano partition-rescue image builder
 #
-# Composes on top of the llfzs/linux build skeleton:
-#   - kernel: code002-2/linux @ piano-7.2.6, config piano_rootfs (unchanged;
-#     its CONFIG_CMDLINE_FORCE already selects rdinit=/pianoinit)
-#   - initramfs: embedded via CONFIG_INITRAMFS_SOURCE (repo-verified path),
-#     entry = <staging>/pianoinit  (this directory's `pianoinit`)
-#   - boot.img: header v4 / pagesize 4096 / base 0 / offsets per
-#     boot/stock-boot-params.env (CONFIRMED values), no external ramdisk
-#   - dtbo: passed through via --dtbo (build it with the repo's
-#     scripts/build-dtbo.py over boot/dtbo-piano-rootfs.dts)
+# Kernel config path (matches upstream build-rootfs-image.sh exactly):
+#   piano_defconfig  ->  merge piano_rootfs.config fragment  ->  olddefconfig
+#   (the rootfs config is a FRAGMENT; using it as a full .config produces a
+#    broken kernel — that was the v1 bug: no USB, no display, black screen.)
 #
-# RAM-boot via `fastboot boot` does NOT need an AVB footer. Only a cold
-# boot from boot_b does — run the repo's scripts/sign-boot-avb.sh first then.
+# dtbo: build with the repo's scripts/build-dtbo.py over
+#   boot/dtbo-piano-power.dts  (the source upstream rootfs builds use).
 #
-# Repo layout auto-detection: this script may live anywhere inside the
-# llfzs/linux clone (e.g. partition-env/); the repo root is found by walking
-# up until a directory containing mkbootimg/ appears. Override with --repo-root.
+# boot.img: vendored mkbootimg, header v4 / pagesize 4096 / base 0 /
+#   offsets from boot/stock-boot-params.env; initramfs embedded via
+#   CONFIG_INITRAMFS_SOURCE; entry = /pianoinit (repo-rootfs forced cmdline).
 #
-# Tools directory layout (--tools-dir):
-#   bin/   executables (static busybox goes via --busybox instead)
-#   lib/   shared-library closure with Debian arm64 layout, e.g.
-#          lib/ld-linux-aarch64.so.1, lib/aarch64-linux-gnu/*.so.*
-#   (A flat directory of executables also works — legacy mode, libs ignored.)
-#
-# Usage:
-#   ./build-partition-image.sh \
-#     --kernel-src ../linux-piano \
-#     --busybox  /path/to/busybox.static \
-#     --smmu-tool /path/to/piano-qup-smmu \
-#     --tools-dir /path/to/tools \
-#     [--dtbo /path/to/dtbo.img] [--config piano_rootfs] [--jobs N]
-#     [--dropbear-tree DIR] [--repo-root DIR] [--gcc] [--out out/partition-image]
+# RAM-boot via `fastboot boot` needs no AVB footer (cold boot_b does).
 
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-# --- locate the llfzs/linux repo root (dir containing mkbootimg/) ----------
 REPO_ROOT=""
 _d="$HERE"
 for _i in 1 2 3 4 5; do
@@ -50,14 +31,13 @@ BUSYBOX=""
 SMMU_TOOL=""
 TOOLS_DIR=""
 DTBO=""
-CONFIG_NAME="piano_rootfs"
 DROPBEAR_TREE=""
+FRAGMENT="piano_rootfs"
 JOBS=$(nproc)
 OUT=""
 STAGING=""
-USE_LLVM=1
 
-usage() { sed -n '2,40p' "$0" >&2; exit 2; }
+usage() { sed -n '2,20p' "$0" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,13 +46,12 @@ while [ $# -gt 0 ]; do
         --smmu-tool)     SMMU_TOOL=$2;     shift 2 ;;
         --tools-dir)     TOOLS_DIR=$2;     shift 2 ;;
         --dtbo)          DTBO=$2;          shift 2 ;;
-        --config)        CONFIG_NAME=$2;   shift 2 ;;
         --dropbear-tree) DROPBEAR_TREE=$2; shift 2 ;;
+        --fragment)      FRAGMENT=$2;      shift 2 ;;
         --repo-root)     REPO_ROOT=$2;     shift 2 ;;
         --jobs)          JOBS=$2;          shift 2 ;;
         --out)           OUT=$2;           shift 2 ;;
         --staging)       STAGING=$2;       shift 2 ;;
-        --gcc)           USE_LLVM=0;       shift ;;
         -h|--help)       usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
     esac
@@ -80,25 +59,25 @@ done
 
 die() { echo "build-partition-image: $*" >&2; exit 1; }
 
-[ -n "$REPO_ROOT" ] || die "cannot locate llfzs/linux repo root (no mkbootimg/ found upward from $HERE); pass --repo-root"
+[ -n "$REPO_ROOT" ] || die "cannot locate repo root (no mkbootimg/); pass --repo-root"
 OUT=${OUT:-$REPO_ROOT/out/partition-image}
 STAGING=${STAGING:-$REPO_ROOT/out/partition-staging}
 
-[ -n "$KERNEL_SRC" ] || die "--kernel-src required (code002-2/linux @ piano-7.2.6)"
+[ -n "$KERNEL_SRC" ] || die "--kernel-src required"
 [ -d "$KERNEL_SRC" ] || die "kernel src not found: $KERNEL_SRC"
 [ -x "$(command -v python3)" ] || die "python3 required"
 for t in make gcc flex bison cpio; do
     command -v "$t" >/dev/null || die "missing host tool: $t"
 done
+command -v clang >/dev/null || die "clang required (upstream builds are LLVM=1)"
 [ -n "$BUSYBOX" ] && [ -f "$BUSYBOX" ]  || die "--busybox <static busybox> required"
 [ -n "$SMMU_TOOL" ] && [ -f "$SMMU_TOOL" ] || die "--smmu-tool <piano-qup-smmu> required"
-[ -n "$TOOLS_DIR" ] || die "--tools-dir <dir> required"
-[ -d "$TOOLS_DIR" ] || die "tools dir not found: $TOOLS_DIR"
+[ -n "$TOOLS_DIR" ] || die "--tools-dir required"
 [ -f "$HERE/pianoinit" ] || die "pianoinit not next to this script"
-CONFIG_FILE="$KERNEL_SRC/arch/arm64/configs/${CONFIG_NAME}.config"
-[ -f "$CONFIG_FILE" ] || die "kernel config not found: $CONFIG_FILE"
+FRAG_FILE="$KERNEL_SRC/arch/arm64/configs/${FRAGMENT}.config"
+[ -f "$FRAG_FILE" ] || die "kernel config fragment not found: $FRAG_FILE"
+[ -f "$KERNEL_SRC/arch/arm64/configs/piano_defconfig" ] || die "piano_defconfig missing"
 
-# mkbootimg from the repo (vendored AOSP tool)
 MKBOOTIMG=""
 for c in "$REPO_ROOT/mkbootimg/mkbootimg.py" "$REPO_ROOT/mkbootimg/mkbootimg"; do
     [ -f "$c" ] && MKBOOTIMG="$c" && break
@@ -110,16 +89,12 @@ if [ -n "$DTBO" ]; then
 else
     echo "NOTE: --dtbo not given; producing boot.img only." >&2
     echo "      Build one with: python3 scripts/build-dtbo.py \\" >&2
-    echo "        --dts boot/dtbo-piano-rootfs.dts --kernel-dir <kernel> \\" >&2
+    echo "        --dts boot/dtbo-piano-power.dts --kernel-dir <kernel> \\" >&2
     echo "        --output <out>/dtbo.img" >&2
 fi
 
-if [ "$USE_LLVM" = 1 ]; then
-    command -v clang >/dev/null || die "clang required (or pass --gcc)"
-    KMAKE="make LLVM=1"
-else
-    KMAKE="make"
-fi
+KBUILD_OUT="$KERNEL_SRC/out/partition-build"
+KMAKE=(make -C "$KERNEL_SRC" O="$KBUILD_OUT" ARCH=arm64 LLVM=1)
 
 mkdir -p "$OUT"
 rm -rf "$STAGING"
@@ -141,7 +116,6 @@ if [ -d "$TOOLS_DIR/bin" ]; then
         cp -a "$TOOLS_DIR/lib/." "$STAGING/lib/"
     fi
 else
-    # legacy flat layout: executables only
     find "$TOOLS_DIR" -maxdepth 1 -type f -executable -print0 |
     while IFS= read -r -d '' f; do install -m 0755 "$f" "$STAGING/bin/"; done
 fi
@@ -153,51 +127,52 @@ if [ -n "$DROPBEAR_TREE" ]; then
         die "failed to copy dropbear tree"
 fi
 
-# ------------------------------------------------------------- kernel build --
-echo ">> preparing kernel config (INITRAMFS_SOURCE=$STAGING)"
+# ------------------------------------------------------------- kernel config --
+echo ">> config: piano_defconfig + $FRAGMENT fragment (upstream path)"
 (
     cd "$KERNEL_SRC"
-    cp "arch/arm64/configs/${CONFIG_NAME}.config" .config
+    "${KMAKE[@]}" piano_defconfig >/dev/null
+    if [ -x ./scripts/kconfig/merge_config.sh ]; then
+        ./scripts/kconfig/merge_config.sh -m -O "$KBUILD_OUT" \
+            "$KBUILD_OUT/.config" \
+            "arch/arm64/configs/${FRAGMENT}.config" >/dev/null
+    else
+        cat "arch/arm64/configs/${FRAGMENT}.config" >> "$KBUILD_OUT/.config"
+    fi
+    "${KMAKE[@]}" olddefconfig >/dev/null
+    # embed the partition initramfs
     if [ -x ./scripts/config ]; then
-        ./scripts/config --file .config \
+        ./scripts/config --file "$KBUILD_OUT/.config" \
             --set-str CONFIG_INITRAMFS_SOURCE "$STAGING"
     else
-        sed -i "/CONFIG_INITRAMFS_SOURCE/d" .config
-        echo "CONFIG_INITRAMFS_SOURCE=\"$STAGING\"" >> .config
+        sed -i "/CONFIG_INITRAMFS_SOURCE/d" "$KBUILD_OUT/.config"
+        echo "CONFIG_INITRAMFS_SOURCE=\"$STAGING\"" >> "$KBUILD_OUT/.config"
     fi
-    $KMAKE ARCH=arm64 olddefconfig >/dev/null
+    "${KMAKE[@]}" olddefconfig >/dev/null
+    # hard gates from the upstream build
+    for opt in CONFIG_CMDLINE_FORCE=y CONFIG_EXT4_FS=y CONFIG_DRM_SIMPLEDRM=y \
+               CONFIG_SCSI_UFSHCD=m CONFIG_SCSI_UFS_QCOM=m \
+               CONFIG_PHY_QCOM_QMP_UFS=m CONFIG_USB_CONFIGFS_NCM=y; do
+        grep -qxF "$opt" "$KBUILD_OUT/.config" ||
+            { echo "Required: $opt" >&2; exit 1; }
+    done
 )
 
-# Two-pass build:
-#   pass 1: Image + modules together — generates modules.builtin and
-#           include/config/kernel.release, both required by modules_install
-#           (a bare `make modules` produces neither, and modules_install
-#           then fails with "No rule to make target 'modules.builtin'").
-#   install: modules_install populates $STAGING/lib/modules.
-#   pass 2: re-link Image so the embedded initramfs (CONFIG_INITRAMFS_SOURCE
-#           → $STAGING) contains those modules. The initramfs intermediates
-#           are removed first — kbuild does not track staging tree content
-#           changes on its own.
+# ----------------------------------------------------------- two-pass build --
 echo ">> building Image + modules (pass 1)"
-$KMAKE -C "$KERNEL_SRC" ARCH=arm64 -j"$JOBS" Image modules >/dev/null
+"${KMAKE[@]}" -j"$JOBS" Image modules >/dev/null
 echo ">> installing modules into staging"
-$KMAKE -C "$KERNEL_SRC" ARCH=arm64 INSTALL_MOD_PATH="$STAGING" \
-    modules_install >/dev/null
-# strip build/source symlinks (absolute paths, useless inside initramfs)
-KVER=$(make -s -C "$KERNEL_SRC" ARCH=arm64 kernelrelease)
+"${KMAKE[@]}" INSTALL_MOD_PATH="$STAGING" modules_install >/dev/null
+KVER=$(cat "$KBUILD_OUT/include/config/kernel.release")
 rm -f "$STAGING/lib/modules/$KVER/build" "$STAGING/lib/modules/$KVER/source"
 
-echo ">> rebuilding Image (pass 2, kernel $KVER, initramfs with modules)"
-find "$KERNEL_SRC/usr" -maxdepth 1 -name 'initramfs_data*' -delete 2>/dev/null || true
-$KMAKE -C "$KERNEL_SRC" ARCH=arm64 -j"$JOBS" Image >/dev/null
-IMAGE="$KERNEL_SRC/arch/arm64/boot/Image"
+echo ">> rebuilding Image (pass 2, $KVER, initramfs with modules)"
+find "$KBUILD_OUT/usr" -maxdepth 1 -name 'initramfs_data*' -delete 2>/dev/null || true
+"${KMAKE[@]}" -j"$JOBS" Image >/dev/null
+IMAGE="$KBUILD_OUT/arch/arm64/boot/Image"
 [ -f "$IMAGE" ] || die "Image missing after build"
 
 # ------------------------------------------------------------- boot.img ----
-# Parameters from boot/stock-boot-params.env (CONFIRMED section):
-#   header v4, pagesize 4096, base 0, kernel 0x8000, ramdisk 0x1000000,
-#   tags 0x100. No external ramdisk (initramfs is embedded in the Image);
-#   cmdline is forced by CONFIG_CMDLINE_FORCE (rdinit=/pianoinit).
 echo ">> packing boot.img"
 python3 "$MKBOOTIMG" \
     --kernel "$IMAGE" \
@@ -220,8 +195,9 @@ fi
     echo "date:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "kernel:   $KVER ($(git -C "$KERNEL_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown))"
     echo "repo:     $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    echo "config:   ${CONFIG_NAME}.config + INITRAMFS_SOURCE=$STAGING (unmodified cmdline)"
-    echo "compiler: $([ "$USE_LLVM" = 1 ] && echo 'LLVM=1 (clang/lld)' || echo gcc)"
+    echo "config:   piano_defconfig + ${FRAGMENT}.config (merged) + INITRAMFS_SOURCE=$STAGING"
+    echo "compiler: LLVM=1 (clang/lld)"
+    echo "dtbo:     $( [ -n "$DTBO" ] && echo "$(basename "$DTBO")" || echo '(not bundled)') — build source must be boot/dtbo-piano-power.dts"
     echo "entry:    /pianoinit (rdinit from CONFIG_CMDLINE_FORCE)"
     echo "policy:   init performs no persistent writes; GPT surgery is interactive"
     if [ -x "$STAGING/bin/sgdisk" ]; then
@@ -234,10 +210,7 @@ fi
     echo "  fastboot set_active b"
     echo "  fastboot flash dtbo_b dtbo.img"
     echo "  fastboot boot partition-boot.img"
-    echo "  # host: nmcli … 10.42.0.1/24; ssh root@10.42.0.2"
-    echo ""
-    echo "Cold boot from boot_b instead? Sign first with the repo's"
-    echo "scripts/sign-boot-avb.sh (boot_b requires an AVB hash footer)."
+    echo "  # host: 10.42.0.1/24; ssh root@10.42.0.2 (empty password) or nc … 23"
     (cd "$OUT" && sha256sum ./* 2>/dev/null)
 } > "$OUT/MANIFEST.txt"
 

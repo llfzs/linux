@@ -73,11 +73,15 @@ setup_ncm() {
 
 start_ssh() {
     command -v dropbear >/dev/null 2>&1 || return 1
+    # blank-password root over the point-to-point USB link only (matches the
+    # repo test image's --root-password '' mode)
+    grep -q '^root:' /etc/passwd 2>/dev/null ||
+        echo 'root::0:0:root:/root:/bin/sh' > /etc/passwd
     mkdir -p /etc/dropbear
     [ -s /etc/dropbear/dropbear_ed25519_host_key ] ||
         dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null ||
         return 1
-    dropbear -s -j -k -E -p 10.42.0.2:22 -P /run/piano-dropbear.pid \
+    dropbear -B -j -k -E -p 10.42.0.2:22 -P /run/piano-dropbear.pid \
         2>>/run/piano-dropbear.log
 }
 
