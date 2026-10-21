@@ -175,12 +175,32 @@ echo ">> config: piano_defconfig + $FRAGMENT fragment (upstream path)"
 # ----------------------------------------------------------- two-pass build --
 echo ">> building Image + modules (pass 1)"
 "${KMAKE[@]}" -j"$JOBS" Image modules >/dev/null
-echo ">> installing modules into staging"
-"${KMAKE[@]}" INSTALL_MOD_PATH="$STAGING" modules_install >/dev/null
+echo ">> collecting the UFS module closure (upstream style, NOT the full tree)"
+# Upstream builds only embed phy_qcom_qmp_ufs + ufs_qcom and their
+# dependencies; the full modules_install tree is rootfs material and would
+# bloat the image to ~500 MB (v3 bug).
+MODTMP=$(realpath -m "$REPO_ROOT/out/partition-modtmp")
+rm -rf "$MODTMP"
+"${KMAKE[@]}" INSTALL_MOD_PATH="$MODTMP" INSTALL_MOD_STRIP=1 \
+    modules_install >/dev/null
 KVER=$(cat "$KBUILD_OUT/include/config/kernel.release")
-rm -f "$STAGING/lib/modules/$KVER/build" "$STAGING/lib/modules/$KVER/source"
+MODDIR="$STAGING/lib/modules/$KVER"
+rm -rf "$MODDIR"
+for module in phy_qcom_qmp_ufs ufs_qcom; do
+    modprobe -S "$KVER" -d "$MODTMP" --show-depends "$module" |
+    while read -r kind ko _rest; do
+        [ "$kind" = "insmod" ] || continue
+        rel=${ko#"$MODTMP"/lib/modules/"$KVER"/}
+        dst="$MODDIR/$(dirname "$rel")"
+        mkdir -p "$dst"
+        install -m 0644 "$ko" "$dst/"
+    done
+done
+[ "$(find "$MODDIR" -name '*.ko*' | wc -l)" -gt 0 ] ||
+    die "UFS module closure is empty"
+depmod -b "$STAGING" "$KVER" || die "depmod failed"
 
-echo ">> rebuilding Image (pass 2, $KVER, initramfs with modules)"
+echo ">> rebuilding Image (pass 2, $KVER, initramfs with UFS closure)"
 find "$KBUILD_OUT/usr" -maxdepth 1 -name 'initramfs_data*' -delete 2>/dev/null || true
 "${KMAKE[@]}" -j"$JOBS" Image >/dev/null
 IMAGE="$KBUILD_OUT/arch/arm64/boot/Image"
