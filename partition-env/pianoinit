@@ -42,57 +42,106 @@ rescue_shell() {
 }
 
 # ---------------------------------------------------------------- USB NCM ---
-# Inline NCM gadget; host side: static 10.42.0.1/24 (repo-verified pattern).
-# Best effort — never blocks the storage bring-up (rootfs-init lesson).
+# Host side: static 10.42.0.1/24. v6 hardening: dwc3 may finish probing only
+# several seconds after init starts (deferred probes are visible late in
+# the boot log), so wait for the UDC and keep retrying in the background.
+NCM_STATE="not-tried"
+
+udc_present() {
+    [ -n "$(ls /sys/class/udc 2>/dev/null | head -n 1)" ]
+}
+
 setup_ncm() {
-    [ -d /sys/class/udc ] || return 1
+    # idempotent: tear down a previous (possibly half-bound) attempt first
+    if [ -d /config/usb_gadget/g1 ]; then
+        echo "" > /config/usb_gadget/g1/UDC 2>/dev/null
+        sleep 1
+        rm -rf /config/usb_gadget/g1 2>/dev/null
+    fi
     mount -t configfs configfs /config 2>/dev/null || true
-    mkdir -p /config/usb_gadget/g1 || return 1
-    cd /config/usb_gadget/g1 || return 1
-    echo 0x18d1 > idVendor       || return 1
-    echo 0xd002 > idProduct      || return 1
-    mkdir -p strings/0x409
-    echo "0000000000000" > strings/0x409/serialnumber 2>/dev/null
-    echo "Piano"         > strings/0x409/product 2>/dev/null
-    echo "PianoLin"      > strings/0x409/manufacturer 2>/dev/null
-    mkdir -p functions/ncm.usb0
+    mkdir -p /config/usb_gadget/g1 2>/dev/null || { NCM_STATE="configfs-mkdir-failed"; return 1; }
+    cd /config/usb_gadget/g1 || { NCM_STATE="cd-failed"; return 1; }
+    # Windows compatibility (v7):
+    #  - IAD declaration: NCM is a two-interface CDC function; without the
+    #    Miscellaneous device class below, Windows refuses to group it as a
+    #    network device and matches it against unrelated drivers instead
+    #    (observed: enumerated as an "Android ADB device").
+    #  - VID/PID: 0x18d1 (Google) gets claimed by the Google USB/ADB driver
+    #    on Windows; use the Linux Foundation multifunction CDC demo ID so
+    #    the generic class driver wins on both Windows and Linux hosts.
+    echo 0xEF > bDeviceClass   2>/dev/null || { NCM_STATE="bDeviceClass-failed"; return 1; }
+    echo 0x02 > bDeviceSubClass 2>/dev/null || true
+    echo 0x01 > bDeviceProtocol 2>/dev/null || true
+    echo 0x1d6b > idVendor 2>/dev/null     || { NCM_STATE="idVendor-failed"; return 1; }
+    echo 0x0104 > idProduct 2>/dev/null    || { NCM_STATE="idProduct-failed"; return 1; }
+    mkdir -p strings/0x409 functions/ncm.usb0 configs/b.1/strings/0x409 2>/dev/null
+    echo "piano-lin" > strings/0x409/serialnumber 2>/dev/null
+    echo "PianoLin"  > strings/0x409/manufacturer 2>/dev/null
+    echo "Piano NCM" > strings/0x409/product 2>/dev/null
     # fixed test MACs (repo policy for deterministic host configs)
     echo "42:50:69:61:6e:6f" > functions/ncm.usb0/dev_addr  2>/dev/null
     echo "42:50:69:61:6e:70" > functions/ncm.usb0/host_addr 2>/dev/null
-    mkdir -p configs/b.1/strings/0x409
     echo "ncm" > configs/b.1/strings/0x409/configuration 2>/dev/null
-    ln -s functions/ncm.usb0 configs/b.1 2>/dev/null || true
+    ln -sf functions/ncm.usb0 configs/b.1 2>/dev/null
     _udc=$(ls /sys/class/udc 2>/dev/null | head -n 1)
-    [ -n "$_udc" ] || return 1
-    echo "$_udc" > UDC || return 1
+    [ -n "$_udc" ] || { NCM_STATE="no-udc (dwc3 not probed yet)"; cd /; return 1; }
+    echo "$_udc" > UDC 2>/dev/null || { NCM_STATE="udc-bind-failed"; cd /; return 1; }
     sleep 2
-    ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up || return 1
+    ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up 2>/dev/null \
+        || { NCM_STATE="usb0-ifconfig-failed"; cd /; return 1; }
     cd /
+    NCM_STATE="OK"
     return 0
 }
 
 start_ssh() {
     command -v dropbear >/dev/null 2>&1 || return 1
+    # blank-password root over the point-to-point USB link only (matches the
+    # repo test image's --root-password '' mode)
+    grep -q '^root:' /etc/passwd 2>/dev/null ||
+        echo 'root::0:0:root:/root:/bin/sh' > /etc/passwd
     mkdir -p /etc/dropbear
     [ -s /etc/dropbear/dropbear_ed25519_host_key ] ||
         dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null ||
         return 1
-    dropbear -s -j -k -E -p 10.42.0.2:22 -P /run/piano-dropbear.pid \
+    dropbear -B -j -k -E -p 10.42.0.2:22 -P /run/piano-dropbear.pid \
         2>>/run/piano-dropbear.log
+}
+
+ncm_up() {
+    setup_ncm || return 1
+    telnetd 2>/dev/null
+    if start_ssh; then
+        log 'NCM_READY: ssh root@10.42.0.2 (empty password) or nc 10.42.0.2 23'
+    else
+        log 'NCM_READY: nc 10.42.0.2 23 (dropbear unavailable)'
+    fi
+    return 0
 }
 
 log 'INIT: partition-rescue profile (rdinit=/pianoinit)'
 
-if setup_ncm; then
-    log 'NCM_READY: usb0=10.42.0.2/24; host should use 10.42.0.1/24'
-    telnetd 2>/dev/null
-    if start_ssh; then
-        log 'SSH_READY: ssh root@10.42.0.2'
-    else
-        log 'WARN: dropbear unavailable; use: nc 10.42.0.2 23'
-    fi
+_w=0
+while [ "$_w" -lt 30 ]; do
+    udc_present && break
+    sleep 1
+    _w=$((_w + 1))
+done
+
+if ncm_up; then
+    log "NCM up after ${_w}s wait (state: $NCM_STATE)"
 else
-    log 'WARN: USB NCM unavailable (see /run/piano-boot.log); continuing'
+    log "WARN: NCM unavailable ($NCM_STATE); background retry every 5 s"
+    # retry forever in the background — a late dwc3 probe recovers the link
+    (
+        while :; do
+            sleep 5
+            if ncm_up; then
+                log "NCM_READY (late retry, state: $NCM_STATE)"
+                break
+            fi
+        done
+    ) &
 fi
 
 # ------------------------------------------------------ SMMU then UFS path ---
@@ -157,6 +206,7 @@ echo ''
 echo '=============================================================='
 echo ' piano partition-rescue — interactive profile'
 echo '=============================================================='
+echo " NCM  : $NCM_STATE  (usb0: $(ifconfig usb0 2>/dev/null | head -n 1 || echo none))"
 echo ' remote : ssh root@10.42.0.2   (host: 10.42.0.1/24)'
 echo '          or: nc 10.42.0.2 23'
 echo ' storage inventory (/run/partmap.txt):'
