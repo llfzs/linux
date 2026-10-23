@@ -137,10 +137,10 @@ mkdir -p "$ROOTFS/usr/local/bin"
 find "$ROOTFS/usr/lib/piano" "$ROOTFS/usr/local/bin" -type f -exec chmod 0755 {} +
 chroot "$ROOTFS" dconf update
 chroot "$ROOTFS" useradd -m -s /bin/bash -G sudo,audio,video,input,render piano
-PASSWORD=$(openssl rand -base64 18)
-printf 'piano:%s\n' "$PASSWORD" | chroot "$ROOTFS" chpasswd
-chroot "$ROOTFS" passwd -l root
-(umask 077; printf 'User: piano\nPassword: %s\nGNOME autologin is enabled. SSH uses keys only.\n' "$PASSWORD" > "$OUTDIR/login.txt")
+# Fixed credentials (dualboot fork): both root and piano use "piano".
+printf 'piano:piano\n' | chroot "$ROOTFS" chpasswd
+printf 'root:piano\n' | chroot "$ROOTFS" chpasswd
+(umask 077; printf 'User: piano\nPassword: piano\nRoot password: piano\nGNOME autologin is enabled. SSH uses keys only.\n' > "$OUTDIR/login.txt")
 for home in root home/piano; do
     install -d -m 0700 "$ROOTFS/$home/.ssh"
     install -m 0600 "$KEYS" "$ROOTFS/$home/.ssh/authorized_keys"
