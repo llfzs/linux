@@ -1,0 +1,64 @@
+#!/system/bin/sh
+# piano-switch — one-command A/B slot switch for piano dual-boot.
+# Usage:
+#   piano-switch              (or: piano-switch status)   show slot info
+#   piano-switch to-linux     set active slot B (Linux), then reboot
+#   piano-switch to-android   set active slot A (Android), then reboot
+#
+# Internals:
+#  - The kernel HAS BSG support (/sys/class/bsg/ufs-bsg0 exists) but Android's
+#    ueventd does not create /dev/bsg nodes — we mknod them from sysfs.
+#  - qbootctl expects /dev/disk/by-partlabel; Android uses /dev/block/by-name.
+#    We create a compat symlink.
+#  - After a successful switch the script reboots immediately (one-tap UX).
+
+MODDIR=${0%/*}
+QB="$MODDIR/qbootctl"
+
+die() { echo "piano-switch: $*" >&2; exit 1; }
+
+[ -x "$QB" ] || die "qbootctl binary missing at $QB (see module README)"
+
+setup_nodes() {
+    # 1) /dev/bsg/* char nodes from /sys/class/bsg (kernel support is present)
+    mkdir -p /dev/bsg 2>/dev/null || true
+    for d in /sys/class/bsg/*; do
+        [ -d "$d" ] || continue
+        name=${d##*/}
+        [ -c "/dev/bsg/$name" ] && continue
+        dev=$(cat "$d/dev" 2>/dev/null) || continue
+        maj=${dev%:*}; min=${dev#*:}
+        mknod "/dev/bsg/$name" c "$maj" "$min" 2>/dev/null || true
+        chmod 600 "/dev/bsg/$name" 2>/dev/null || true
+    done
+    # 2) by-partlabel compat symlink for qbootctl's device discovery
+    mkdir -p /dev/disk 2>/dev/null || true
+    [ -e /dev/disk/by-partlabel ] || \
+        ln -s /dev/block/by-name /dev/disk/by-partlabel 2>/dev/null || true
+}
+
+setup_nodes
+
+case "${1:-status}" in
+    status)
+        "$QB"
+        ;;
+    to-linux)
+        echo ">> switching to slot B (Linux)..."
+        "$QB" -s b || die "slot switch failed — NOT rebooting"
+        echo ">> done, rebooting in 3s (Ctrl+C to cancel)"
+        sleep 3
+        reboot
+        ;;
+    to-android)
+        echo ">> switching to slot A (Android)..."
+        "$QB" -s a || die "slot switch failed — NOT rebooting"
+        echo ">> done, rebooting in 3s (Ctrl+C to cancel)"
+        sleep 3
+        reboot
+        ;;
+    *)
+        echo "usage: piano-switch [status|to-linux|to-android]"
+        exit 1
+        ;;
+esac

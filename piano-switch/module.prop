@@ -1,0 +1,6 @@
+id=piano-slot-switch
+name=Piano Slot Switch (qbootctl)
+version=v1.0.0
+versionCode=1
+author=lanlf
+description=One-command A/B slot switching for Xiaomi Pad 8 Pro dual-boot (Linux on slot B). Provides /system/bin/piano-switch [status|to-linux|to-android]. Requires the static qbootctl binary placed next to this file.
