@@ -25,13 +25,8 @@ jobs:
       - name: Build static binary (Alpine musl)
         run: |
           docker run --rm -v "$PWD/src":/src alpine:latest sh -eu -c '
-            apk add --no-cache build-base meson ninja zlib-static zlib-dev
+            apk add --no-cache build-base meson ninja linux-headers zlib-static zlib-dev
             cd /src
-            meson setup build --buildtype release \
-                -Dc_link_args="-static -Os" \
-                -Dcpp_link_args="-static -Os" || true
-            # meson setup may fail on a stale dir; retry clean
-            rm -rf build
             meson setup build --buildtype release \
                 -Dc_link_args="-static -Os" \
                 -Dcpp_link_args="-static -Os"
