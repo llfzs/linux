@@ -43,20 +43,31 @@ jobs:
       - name: Package the KernelSU module
         run: |
           set -eu
-          mkdir -p module
-          cp src/qbootctl-static module/qbootctl
-          chmod 0755 module/qbootctl
+          # KSU magic-mount layout: files under system/bin/ appear in PATH
+          mkdir -p module/system/bin
+          cp src/qbootctl-static module/system/bin/qbootctl
+          chmod 0755 module/system/bin/qbootctl
 
           cat > module/module.prop <<'PROP'
           id=piano-slot-switch
           name=Piano Slot Switch (qbootctl)
-          version=v1.0.1
-          versionCode=2
+          version=v1.0.3
+          versionCode=4
           author=lanlf
-          description=One-command A/B slot switching for Xiaomi Pad 8 Pro dual-boot (Linux on slot B). Provides /system/bin/piano-switch [status|to-linux|to-android]. Bundles a static qbootctl; no extra files needed.
+          description=One-command A/B slot switching for Xiaomi Pad 8 Pro dual-boot (Linux on slot B). Installs piano-switch + qbootctl into /system/bin via magic mount; service.sh restores exec bits on boot. Usage: piano-switch [status|to-linux|to-android].
           PROP
 
-          cat > module/piano-switch <<'EOS'
+          # Restore exec bits on every boot — module install/zip chains are
+          # known to drop permission bits (verified on device 2026-10-24).
+          cat > module/service.sh <<'EOS2'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          chmod 0755 "$MODDIR/system/bin/piano-switch" \
+                     "$MODDIR/system/bin/qbootctl" 2>/dev/null
+          EOS2
+          chmod 0755 module/service.sh
+
+          cat > module/system/bin/piano-switch <<'EOS'
           #!/system/bin/sh
           # piano-switch — one-command A/B slot switch for piano dual-boot.
           # Usage:
@@ -125,7 +136,7 @@ jobs:
           esac
           EOS
 
-          chmod 0755 module/piano-switch
+          chmod 0755 module/system/bin/piano-switch
 
           # KSU module zips must have module.prop at the ROOT of the archive
           cd module
