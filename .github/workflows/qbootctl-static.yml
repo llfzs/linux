@@ -1,7 +1,9 @@
 name: qbootctl-static
 
-# Build a static (musl) arm64 qbootctl binary for on-device slot switching.
-# Artifact: qbootctl-static-<sha> — drop it into the piano-switch KSU module.
+# Build the static qbootctl AND package the ready-to-install KernelSU module.
+# Release assets:
+#   - piano-slot-switch.zip   (install directly in KernelSU / Magisk)
+#   - qbootctl-static         (bare binary, for manual use)
 
 on:
   workflow_dispatch:
@@ -38,11 +40,107 @@ jobs:
           file src/qbootctl-static || true
           ls -la src/qbootctl-static
 
-      - name: Upload artifact
+      - name: Package the KernelSU module
+        run: |
+          set -eu
+          mkdir -p module
+          cp src/qbootctl-static module/qbootctl
+          chmod 0755 module/qbootctl
+
+          cat > module/module.prop <<'PROP'
+          id=piano-slot-switch
+          name=Piano Slot Switch (qbootctl)
+          version=v1.0.1
+          versionCode=2
+          author=lanlf
+          description=One-command A/B slot switching for Xiaomi Pad 8 Pro dual-boot (Linux on slot B). Provides /system/bin/piano-switch [status|to-linux|to-android]. Bundles a static qbootctl; no extra files needed.
+          PROP
+
+          cat > module/piano-switch <<'EOS'
+          #!/system/bin/sh
+          # piano-switch — one-command A/B slot switch for piano dual-boot.
+          # Usage:
+          #   piano-switch              (or: piano-switch status)   show slot info
+          #   piano-switch to-linux     set active slot B (Linux), then reboot
+          #   piano-switch to-android   set active slot A (Android), then reboot
+          #
+          # Internals:
+          #  - The kernel HAS BSG support (/sys/class/bsg/ufs-bsg0 exists) but
+          #    ueventd does not create /dev/bsg nodes — we mknod them from sysfs.
+          #  - qbootctl expects /dev/disk/by-partlabel; Android uses
+          #    /dev/block/by-name. We create a compat symlink.
+          #  - After a successful switch the script reboots immediately (one-tap UX).
+
+          MODDIR=${0%/*}
+          QB="$MODDIR/qbootctl"
+
+          die() { echo "piano-switch: $*" >&2; exit 1; }
+
+          [ -f "$QB" ] || die "qbootctl binary missing at $QB"
+          # zip packaging may drop the exec bit — restore it
+          chmod +x "$QB" 2>/dev/null || true
+
+          setup_nodes() {
+              # 1) /dev/bsg/* char nodes from /sys/class/bsg (kernel support is present)
+              mkdir -p /dev/bsg 2>/dev/null || true
+              for d in /sys/class/bsg/*; do
+                  [ -d "$d" ] || continue
+                  name=${d##*/}
+                  [ -c "/dev/bsg/$name" ] && continue
+                  dev=$(cat "$d/dev" 2>/dev/null) || continue
+                  maj=${dev%:*}; min=${dev#*:}
+                  mknod "/dev/bsg/$name" c "$maj" "$min" 2>/dev/null || true
+                  chmod 600 "/dev/bsg/$name" 2>/dev/null || true
+              done
+              # 2) by-partlabel compat symlink for qbootctl's device discovery
+              mkdir -p /dev/disk 2>/dev/null || true
+              [ -e /dev/disk/by-partlabel ] || \
+                  ln -s /dev/block/by-name /dev/disk/by-partlabel 2>/dev/null || true
+          }
+
+          setup_nodes
+
+          case "${1:-status}" in
+              status)
+                  "$QB"
+                  ;;
+              to-linux)
+                  echo ">> switching to slot B (Linux)..."
+                  "$QB" -s b || die "slot switch failed — NOT rebooting"
+                  echo ">> done, rebooting in 3s (Ctrl+C to cancel)"
+                  sleep 3
+                  reboot
+                  ;;
+              to-android)
+                  echo ">> switching to slot A (Android)..."
+                  "$QB" -s a || die "slot switch failed — NOT rebooting"
+                  echo ">> done, rebooting in 3s (Ctrl+C to cancel)"
+                  sleep 3
+                  reboot
+                  ;;
+              *)
+                  echo "usage: piano-switch [status|to-linux|to-android]"
+                  exit 1
+                  ;;
+          esac
+          EOS
+
+          chmod 0755 module/piano-switch
+
+          # KSU module zips must have module.prop at the ROOT of the archive
+          cd module
+          zip -r ../piano-slot-switch.zip .
+          cd ..
+          unzip -l piano-slot-switch.zip
+          ls -la piano-slot-switch.zip src/qbootctl-static
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: qbootctl-static-${{ github.sha }}
-          path: src/qbootctl-static
+          name: piano-slot-switch-${{ github.sha }}
+          path: |
+            piano-slot-switch.zip
+            src/qbootctl-static
           if-no-files-found: error
           retention-days: 90
 
@@ -52,8 +150,15 @@ jobs:
         run: |
           tag="qbootctl-ci-${GITHUB_SHA::12}"
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "qbootctl static $tag" \
-            --notes "Static musl arm64 qbootctl (built from linux-msm/qbootctl@main)." \
-            src/qbootctl-static || true
+            --target "$GITHUB_SHA" --title "piano-slot-switch $tag" \
+            --notes "Ready-to-install KernelSU module for A/B slot switching.
+
+          Install: KernelSU -> Modules -> Install from local -> piano-slot-switch.zip
+          Usage (root shell):
+            piano-switch              # slot status
+            piano-switch to-linux     # switch to Linux (slot B) and reboot
+            piano-switch to-android   # switch to Android (slot A) and reboot
+          Also includes the bare qbootctl-static binary." \
+            piano-slot-switch.zip src/qbootctl-static || true
           gh release upload "$tag" --clobber --repo "$GITHUB_REPOSITORY" \
-            src/qbootctl-static
+            piano-slot-switch.zip src/qbootctl-static
